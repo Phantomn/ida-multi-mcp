@@ -135,9 +135,8 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         """Enforce Content-Type: application/json on MCP endpoints."""
         content_type = self.headers.get("Content-Type", "")
         if "application/json" not in content_type and "text/plain" not in content_type:
-            if content_type:
-                self.send_error(415, "Unsupported Media Type: expected application/json")
-                return False
+            self.send_error(415, "Unsupported Media Type: expected application/json")
+            return False
         return True
 
     def do_GET(self):
@@ -188,6 +187,8 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         """Handle CORS preflight requests"""
+        if not self._check_host_header():
+            return
         self.send_response(200)
         self.send_cors_headers(preflight=True)
         self.end_headers()
@@ -196,13 +197,12 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
     def _handle_sse_get(self):
         # Security: limit SSE connections to prevent resource exhaustion
-        if len(self.mcp_server._sse_connections) >= self._MAX_SSE_CONNECTIONS:
-            self.send_error(503, "Too many SSE connections")
-            return
-
-        # Create SSE connection wrapper
         conn = _McpSseConnection(self.wfile)
-        self.mcp_server._sse_connections[conn.session_id] = conn
+        with self.mcp_server._sse_lock:
+            if len(self.mcp_server._sse_connections) >= self._MAX_SSE_CONNECTIONS:
+                self.send_error(503, "Too many SSE connections")
+                return
+            self.mcp_server._sse_connections[conn.session_id] = conn
 
         try:
             # Send SSE headers
@@ -228,8 +228,8 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
         finally:
             conn.alive = False
-            if conn.session_id in self.mcp_server._sse_connections:
-                del self.mcp_server._sse_connections[conn.session_id]
+            with self.mcp_server._sse_lock:
+                self.mcp_server._sse_connections.pop(conn.session_id, None)
 
     def _handle_sse_post(self, body: bytes):
         query_params = parse_qs(urlparse(self.path).query)
@@ -253,7 +253,8 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
         # Send SSE response if necessary
         if response is not None:
-            sse_conn = self.mcp_server._sse_connections.get(session_id)
+            with self.mcp_server._sse_lock:
+                sse_conn = self.mcp_server._sse_connections.get(session_id)
             if sse_conn is None or not sse_conn.alive:
                 # No SSE connection found
                 self.send_error(400, f"No active SSE connection found for session {session_id}")
@@ -312,6 +313,7 @@ class McpServer:
         self._server_thread: threading.Thread | None = None
         self._running = False
         self._sse_connections: dict[str, _McpSseConnection] = {}
+        self._sse_lock = threading.Lock()
         self._protocol_version = threading.local()
         self._enabled_extensions = threading.local()  # set[str] per request
         self._extensions_registry = extensions if extensions is not None else {}  # group -> set of tool names
@@ -400,9 +402,10 @@ class McpServer:
         self._running = False
 
         # Close all SSE connections
-        for conn in self._sse_connections.values():
-            conn.alive = False
-        self._sse_connections.clear()
+        with self._sse_lock:
+            for conn in self._sse_connections.values():
+                conn.alive = False
+            self._sse_connections.clear()
 
         # Shutdown the HTTP server
         if self._http_server:

@@ -190,7 +190,7 @@ class JsonRpcRegistry:
         if self.redact_exceptions:
             return {
                 "code": -32603,
-                "message": f"Internal Error: {str(e)}",
+                "message": f"Internal Error: {type(e).__name__}",
             }
         return {
             "code": -32603,

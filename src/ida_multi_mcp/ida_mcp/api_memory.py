@@ -265,6 +265,9 @@ def patch(patches: list[MemoryPatch] | MemoryPatch) -> list[dict]:
             ea = parse_address(patch["addr"])
             data = bytes.fromhex(patch["data"])
 
+            if len(data) > _MAX_READ_SIZE:
+                raise ValueError(f"Patch size {len(data)} exceeds maximum of {_MAX_READ_SIZE} bytes")
+
             ida_bytes.patch_bytes(ea, data)
             results.append(
                 {"addr": patch["addr"], "size": len(data), "ok": True, "error": None}

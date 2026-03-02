@@ -602,10 +602,15 @@ def dbg_write(regions: list[MemoryPatch] | MemoryPatch) -> list[dict]:
     dbg_ensure_running()
     results = []
 
+    _MAX_WRITE_SIZE = 1048576  # 1MB max per region
+
     for region in regions:
         try:
             addr = parse_address(region["addr"])
             data = bytes.fromhex(region["data"])
+
+            if len(data) > _MAX_WRITE_SIZE:
+                raise ValueError(f"Write size {len(data)} exceeds maximum of {_MAX_WRITE_SIZE} bytes")
 
             success = idaapi.dbg_write_memory(addr, data)
             results.append(

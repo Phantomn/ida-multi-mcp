@@ -28,10 +28,11 @@ from .utils import (
 # ============================================================================
 
 
-@tool
-@idasync
 _MAX_BATCH_SIZE = 500
 
+
+@tool
+@idasync
 def set_comments(items: list[CommentOp] | CommentOp):
     """Set comments at addresses (both disassembly and decompiler views)"""
     if isinstance(items, dict):
