@@ -32,6 +32,46 @@ MCP Client (Claude, Cursor, etc.)
 - **File-based registry** — Tracks all active instances
 - **Graceful fallback** — Handles binary changes, stale instances, and crashes
 
+## Headless Mode (idalib)
+
+Run without IDA Pro GUI using idalib:
+
+### Basic usage (stdio)
+```bash
+idalib-multi-mcp path/to/binary
+```
+
+### SSE server
+```bash
+idalib-multi-mcp --host 127.0.0.1 --port 8745 path/to/binary
+```
+
+### Multi-binary session management
+```bash
+# Start with initial binary
+idalib-multi-mcp --host 127.0.0.1 --port 8745 ./main_binary
+
+# Then from MCP client:
+# idalib_open("/path/to/libc.so.6")   # Open additional binary
+# idalib_list()                         # List all sessions
+# idalib_switch("session_id")           # Switch between binaries
+# decompile("main")                     # Analyze current binary
+```
+
+### Isolated contexts (multi-agent)
+```bash
+idalib-multi-mcp --isolated-contexts --host 127.0.0.1 --port 8745
+```
+
+### Claude Code configuration
+```bash
+claude mcp add idalib-multi-mcp -s user -- idalib-multi-mcp
+```
+
+### Requirements
+- [idalib](https://docs.hex-rays.com/user-guide/idalib) installed (IDA Pro SDK)
+- Python 3.11+
+
 ## Requirements
 
 - Python 3.11 or later
@@ -479,7 +519,6 @@ Do not use unquoted `\\?\...` project table keys, and do not use double-quoted W
 
 - Supports 127.0.0.1 only (localhost analysis)
 - Remote IDA instances not supported in v1.0
-- Does not support IDA batch/headless (idalib) mode yet
 - Resources (not tools) require manual routing in v1.0
 
 ## License

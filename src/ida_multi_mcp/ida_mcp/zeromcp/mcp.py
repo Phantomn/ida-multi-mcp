@@ -1,8 +1,12 @@
 import re
+import select
+import socket
 import sys
 import time
 import uuid
 import json
+import gzip
+import zlib
 import inspect
 import threading
 import traceback
@@ -100,13 +104,8 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         if preflight:
             self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, X-Requested-With, Mcp-Session-Id, Mcp-Protocol-Version")
-            # Security: only allow private network access when CORS is explicitly unrestricted
             if self.headers.get("Access-Control-Request-Private-Network") == "true":
-                allowed = self.mcp_server.cors_allowed_origins
-                if isinstance(allowed, list) and "*" in allowed:
-                    self.send_header("Access-Control-Allow-Private-Network", "true")
-                elif isinstance(allowed, str) and allowed == "*":
-                    self.send_header("Access-Control-Allow-Private-Network", "true")
+                self.send_header("Access-Control-Allow-Private-Network", "true")
 
     def send_error(self, code, message=None, explain=None):
         self.send_response(code)
@@ -124,10 +123,6 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
-        # Security: validate Host header to prevent DNS rebinding
-        if not self._check_host_header():
-            return
-
         match urlparse(self.path).path:
             case "/sse":
                 self._handle_sse_get()
@@ -136,75 +131,73 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             case _:
                 self.send_error(404, "Not Found")
 
-    def _check_host_header(self) -> bool:
-        """Validate Host header to prevent DNS rebinding attacks on all endpoints."""
-        host_header = self.headers.get("Host", "")
-        # Strip port to get hostname
-        hostname = host_header.split(":")[0] if host_header else ""
-        if hostname not in ("127.0.0.1", "localhost", "::1", ""):
-            self.send_error(403, "Forbidden: invalid Host header")
-            return False
-        return True
-
-    def _check_content_type_json(self) -> bool:
-        """Enforce Content-Type: application/json on MCP endpoints."""
-        content_type = self.headers.get("Content-Type", "")
-        if "application/json" not in content_type and "text/plain" not in content_type:
-            self.send_error(415, "Unsupported Media Type: expected application/json")
-            return False
-        return True
-
     def do_POST(self):
-        # Security: validate Host header to prevent DNS rebinding
-        if not self._check_host_header():
+        body = self._read_body()
+        if body is None:
             return
-
-        # Read request body with validated Content-Length
-        try:
-            content_length = int(self.headers.get("Content-Length", 0))
-        except (ValueError, TypeError):
-            self.send_error(400, "Invalid Content-Length header")
-            return
-
-        if content_length < 0:
-            self.send_error(400, "Invalid Content-Length: must be non-negative")
-            return
-
-        if content_length > self.mcp_server.post_body_limit:
-            self.send_error(413, f"Payload Too Large: exceeds {self.mcp_server.post_body_limit} bytes")
-            return
-
-        body = self.rfile.read(content_length) if content_length > 0 else b""
 
         match urlparse(self.path).path:
             case "/sse":
                 self._handle_sse_post(body)
             case "/mcp":
-                # Security: enforce JSON content type to force CORS preflight
-                if not self._check_content_type_json():
-                    return
                 self._handle_mcp_post(body)
             case _:
                 self.send_error(404, "Not Found")
 
     def do_OPTIONS(self):
         """Handle CORS preflight requests"""
-        if not self._check_host_header():
-            return
         self.send_response(200)
         self.send_cors_headers(preflight=True)
         self.end_headers()
 
-    _MAX_SSE_CONNECTIONS = 10
+    def _read_body(self) -> bytes | None:
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            raw = self._read_chunked()
+        else:
+            content_length = int(self.headers.get("Content-Length", 0))
+            if content_length > self.mcp_server.post_body_limit:
+                self.send_error(413, f"Payload Too Large: exceeds {self.mcp_server.post_body_limit} bytes")
+                return None
+            raw = self.rfile.read(content_length) if content_length > 0 else b""
+
+        if len(raw) > self.mcp_server.post_body_limit:
+            self.send_error(413, f"Payload Too Large: exceeds {self.mcp_server.post_body_limit} bytes")
+            return None
+
+        return self._decompress_body(raw)
+
+    def _read_chunked(self) -> bytes:
+        body = b""
+        limit = self.mcp_server.post_body_limit
+        while True:
+            line = self.rfile.readline().split(b";")[0].strip()
+            chunk_size = int(line, 16)
+            if chunk_size == 0:
+                # Consume trailer fields until blank line
+                while self.rfile.readline().strip():
+                    pass
+                break
+            body += self.rfile.read(min(chunk_size, limit + 1 - len(body)))
+            if len(body) > limit:
+                return body
+            self.rfile.readline()
+        return body
+
+    def _decompress_body(self, data: bytes) -> bytes:
+        encoding = self.headers.get("Content-Encoding", "").lower().strip()
+        if encoding in ("gzip", "x-gzip"):
+            return gzip.decompress(data)
+        elif encoding == "deflate":
+            if data[:1] == b'\x78':
+                return zlib.decompress(data)
+            else:
+                return zlib.decompress(data, -15)
+        return data
 
     def _handle_sse_get(self):
-        # Security: limit SSE connections to prevent resource exhaustion
+        # Create SSE connection wrapper
         conn = _McpSseConnection(self.wfile)
-        with self.mcp_server._sse_lock:
-            if len(self.mcp_server._sse_connections) >= self._MAX_SSE_CONNECTIONS:
-                self.send_error(503, "Too many SSE connections")
-                return
-            self.mcp_server._sse_connections[conn.session_id] = conn
+        self.mcp_server._sse_connections[conn.session_id] = conn
 
         try:
             # Send SSE headers
@@ -218,20 +211,42 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             # Send endpoint event with session ID for routing
             conn.send_event("endpoint", f"/sse?session={conn.session_id}")
 
-            # Keep connection alive with periodic pings
+            # TCP disconnect: kernel gets FIN/RST immediately, but Python only sees it when we
+            # read (EOF) or write (BrokenPipeError). We only write every 30s, so we never "see"
+            # the disconnect until then. Fix: use select() to wait for socket readable; when
+            # client closes, socket becomes readable and recv() returns 0 (EOF).
+            sock = self.connection
+            if sock and hasattr(sock, "settimeout"):
+                try:
+                    sock.settimeout(1.0)
+                except OSError:
+                    pass
+
             last_ping = time.time()
             while conn.alive and self.mcp_server._running:
                 now = time.time()
+                # Detect disconnect without writing: select() says when socket is readable
+                if sock:
+                    try:
+                        r, _, _ = select.select([sock], [], [], 1.0)
+                        if r:
+                            # Readable: peer closed (EOF) or sent data. SSE client sends nothing.
+                            if sock.recv(1, socket.MSG_PEEK) == b"":
+                                break
+                    except (OSError, socket.error, ConnectionResetError, BrokenPipeError):
+                        break
+                else:
+                    time.sleep(1)
+
                 if now - last_ping > 30:  # Ping every 30 seconds
                     if not conn.send_event("ping", {}):
                         break
                     last_ping = now
-                time.sleep(1)
 
         finally:
             conn.alive = False
-            with self.mcp_server._sse_lock:
-                self.mcp_server._sse_connections.pop(conn.session_id, None)
+            if conn.session_id in self.mcp_server._sse_connections:
+                del self.mcp_server._sse_connections[conn.session_id]
 
     def _handle_sse_post(self, body: bytes):
         query_params = parse_qs(urlparse(self.path).query)
@@ -240,28 +255,27 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             self.send_error(400, "Missing ?session for SSE POST")
             return
 
+        sse_conn = self.mcp_server._sse_connections.get(session_id)
+        if sse_conn is None or not sse_conn.alive:
+            self.send_error(400, f"No active SSE connection found for session {session_id}")
+            return
+
         # Parse extensions from query params and store in thread-local
         extensions = self._parse_extensions(self.path)
         setattr(self.mcp_server._enabled_extensions, "data", extensions)
+        setattr(self.mcp_server._transport_session_id, "data", f"sse:{session_id}")
 
-        # Dispatch to MCP registry
-        setattr(self.mcp_server._protocol_version, "data", "2024-11-05")
         try:
+            # Dispatch to MCP registry
+            setattr(self.mcp_server._protocol_version, "data", "2024-11-05")
             response = self.mcp_server.registry.dispatch(body)
         finally:
-            # Clean up thread-local state to prevent leaking between requests
-            self.mcp_server._enabled_extensions.data = set()
-            self.mcp_server._protocol_version.data = None
+            setattr(self.mcp_server._enabled_extensions, "data", set())
+            setattr(self.mcp_server._protocol_version, "data", None)
+            setattr(self.mcp_server._transport_session_id, "data", None)
 
         # Send SSE response if necessary
         if response is not None:
-            with self.mcp_server._sse_lock:
-                sse_conn = self.mcp_server._sse_connections.get(session_id)
-            if sse_conn is None or not sse_conn.alive:
-                # No SSE connection found
-                self.send_error(400, f"No active SSE connection found for session {session_id}")
-                return
-
             # Send response via SSE event stream
             sse_conn.send_event("message", response)
 
@@ -274,23 +288,60 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _handle_mcp_post(self, body: bytes):
+        request_method: str | None = None
+        try:
+            parsed = json.loads(body)
+            if isinstance(parsed, dict):
+                method = parsed.get("method")
+                if isinstance(method, str):
+                    request_method = method
+        except Exception:
+            pass
+
+        mcp_session_id = self.headers.get("Mcp-Session-Id")
+        if self.mcp_server.require_streamable_http_session:
+            if request_method == "initialize":
+                if mcp_session_id is None:
+                    mcp_session_id = str(uuid.uuid4())
+                self.mcp_server.register_http_session(mcp_session_id)
+            else:
+                if mcp_session_id is None:
+                    self.send_error(
+                        400,
+                        "Missing Mcp-Session-Id header. Call initialize first and "
+                        "reuse the returned Mcp-Session-Id.",
+                    )
+                    return
+                if not self.mcp_server.has_http_session(mcp_session_id):
+                    print(
+                        f"[MCP] Re-registering HTTP session {mcp_session_id} after reconnect"
+                    )
+                    self.mcp_server.register_http_session(mcp_session_id)
+
         # Parse extensions from query params and store in thread-local
         extensions = self._parse_extensions(self.path)
         setattr(self.mcp_server._enabled_extensions, "data", extensions)
+        setattr(
+            self.mcp_server._transport_session_id,
+            "data",
+            f"http:{mcp_session_id}" if mcp_session_id else "http:anonymous",
+        )
 
         # Dispatch to MCP registry
         setattr(self.mcp_server._protocol_version, "data", "2025-06-18")
         try:
             response = self.mcp_server.registry.dispatch(body)
         finally:
-            # Clean up thread-local state to prevent leaking between requests
-            self.mcp_server._enabled_extensions.data = set()
-            self.mcp_server._protocol_version.data = None
+            setattr(self.mcp_server._enabled_extensions, "data", set())
+            setattr(self.mcp_server._protocol_version, "data", None)
+            setattr(self.mcp_server._transport_session_id, "data", None)
 
         def send_response(status: int, body: bytes):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            if mcp_session_id is not None:
+                self.send_header("Mcp-Session-Id", mcp_session_id)
             self.send_cors_headers()
             self.end_headers()
             self.wfile.write(body)
@@ -315,10 +366,13 @@ class McpServer:
         self._server_thread: threading.Thread | None = None
         self._running = False
         self._sse_connections: dict[str, _McpSseConnection] = {}
-        self._sse_lock = threading.Lock()
+        self._http_sessions: set[str] = set()
+        self._http_sessions_lock = threading.Lock()
         self._protocol_version = threading.local()
+        self._transport_session_id = threading.local()
         self._enabled_extensions = threading.local()  # set[str] per request
         self._extensions_registry = extensions if extensions is not None else {}  # group -> set of tool names
+        self.require_streamable_http_session = False
 
         # Register MCP protocol methods with correct names
         self.registry = JsonRpcRegistry()
@@ -357,9 +411,11 @@ class McpServer:
             request_handler,
             bind_and_activate=False
         )
+        # allow_reuse_address=True allows fast restarts (skip TCP TIME_WAIT).
+        # Do NOT set allow_reuse_port: on macOS SO_REUSEPORT lets multiple
+        # processes silently bind the same port, causing request mis-routing
+        # and SIGPIPE crashes when one instance closes.
         self._http_server.allow_reuse_address = True
-        if hasattr(self._http_server, "allow_reuse_port"):
-            self._http_server.allow_reuse_port = True
 
         # Set the MCPServer instance on the handler class
         setattr(self._http_server, "mcp_server", self)
@@ -403,10 +459,9 @@ class McpServer:
         self._running = False
 
         # Close all SSE connections
-        with self._sse_lock:
-            for conn in self._sse_connections.values():
-                conn.alive = False
-            self._sse_connections.clear()
+        for conn in self._sse_connections.values():
+            conn.alive = False
+        self._sse_connections.clear()
 
         # Shutdown the HTTP server
         if self._http_server:
@@ -422,14 +477,12 @@ class McpServer:
 
         print("[MCP] Server stopped")
 
-    _STDIO_MAX_LINE = 10 * 1024 * 1024  # 10MB, matches HTTP limit
-
     def stdio(self, stdin: BinaryIO | None = None, stdout: BinaryIO | None = None):
         stdin = stdin or sys.stdin.buffer
         stdout = stdout or sys.stdout.buffer
         while True:
             try:
-                request = stdin.readline(self._STDIO_MAX_LINE + 1)
+                request = stdin.readline()
                 if not request: # EOF
                     break
 
@@ -438,20 +491,27 @@ class McpServer:
                 if not request:
                     continue
 
-                # Security: enforce size limit on stdio input
-                if len(request) > self._STDIO_MAX_LINE:
-                    response = self.registry._error(None, -32600, "Request too large")
-                    if response:
-                        stdout.write(json.dumps(response).encode("utf-8") + b"\n")
-                        stdout.flush()
-                    continue
-
-                response = self.registry.dispatch(request)
+                setattr(self._transport_session_id, "data", "stdio:default")
+                try:
+                    response = self.registry.dispatch(request)
+                finally:
+                    setattr(self._transport_session_id, "data", None)
                 if response is not None:
                     stdout.write(json.dumps(response).encode("utf-8") + b"\n")
                     stdout.flush()
             except (BrokenPipeError, KeyboardInterrupt): # Client disconnected
                 break
+
+    def get_current_transport_session_id(self) -> str | None:
+        return getattr(self._transport_session_id, "data", None)
+
+    def register_http_session(self, session_id: str) -> None:
+        with self._http_sessions_lock:
+            self._http_sessions.add(session_id)
+
+    def has_http_session(self, session_id: str) -> bool:
+        with self._http_sessions_lock:
+            return session_id in self._http_sessions
 
     def cors_localhost(self, origin: str) -> bool:
         """Allow CORS requests from localhost on ANY port."""
@@ -534,7 +594,7 @@ class McpServer:
             result = tool_response.get("result") if tool_response else None
             return {
                 "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
-                "structuredContent": result,
+                "structuredContent": result if isinstance(result, dict) else {"result": result},
                 "isError": False,
             }
         finally:
@@ -819,6 +879,15 @@ class McpServer:
         # Add outputSchema if return type exists and is not None
         if return_type and return_type is not type(None):
             return_schema = self._type_to_json_schema(return_type)
+
+            # Wrap non-object returns in a "result" property
+            if return_schema.get("type") != "object":
+                return_schema = {
+                    "type": "object",
+                    "properties": {"result": return_schema},
+                    "required": ["result"],
+                }
+
             schema["outputSchema"] = return_schema
 
         return schema

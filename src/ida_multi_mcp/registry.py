@@ -150,13 +150,14 @@ class InstanceRegistry:
                 except OSError:
                     pass
 
-    def register(self, pid: int, port: int, idb_path: str, **metadata) -> str:
+    def register(self, pid: int, port: int, idb_path: str, instance_type: str = "gui", **metadata) -> str:
         """Register a new IDA instance.
 
         Args:
             pid: Process ID
             port: MCP server port
             idb_path: Path to the IDB file being analyzed
+            instance_type: Instance type ("gui" or "headless"), default "gui"
             **metadata: Additional metadata (binary_name, binary_path, arch, host, etc.)
 
         Returns:
@@ -193,6 +194,7 @@ class InstanceRegistry:
                 "binary_path": metadata.get("binary_path", ""),
                 "idb_path": idb_path,
                 "arch": metadata.get("arch", "unknown"),
+                "type": instance_type,
                 "registered_at": self._iso_timestamp(),
                 "last_heartbeat": self._iso_timestamp(),
             }

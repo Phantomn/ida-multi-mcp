@@ -13,6 +13,7 @@ dependencies = []
 
 [project.scripts]
 ida-multi-mcp = "ida_multi_mcp.__main__:main"
+idalib-multi-mcp = "ida_multi_mcp.idalib_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

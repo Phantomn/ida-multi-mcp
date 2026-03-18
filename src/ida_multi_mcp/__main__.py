@@ -16,6 +16,7 @@ from .server import serve
 from .registry import InstanceRegistry
 
 SERVER_NAME = "ida-multi-mcp"
+IDALIB_SERVER_NAME = "idalib-multi-mcp"
 
 
 def _replace_or_overwrite_file(src: str, dst: str, *, attempts: int = 6) -> bool:
@@ -131,6 +132,15 @@ def generate_mcp_config(*, include_type: bool = False):
     if copy_python_env(env):
         mcp_config["env"] = env
     return mcp_config
+
+
+def generate_idalib_mcp_config() -> dict:
+    """Generate MCP server configuration for idalib-multi-mcp (headless mode).
+
+    Uses the idalib-multi-mcp CLI directly (no Python interpreter path needed).
+    idalib-multi-mcp requires idalib to be installed separately.
+    """
+    return {"command": IDALIB_SERVER_NAME, "args": []}
 
 
 def print_mcp_config():
@@ -670,17 +680,24 @@ def install_mcp_servers(uninstall=False, quiet=False):
             del mcp_servers[old_name_full]
 
         if uninstall:
-            if SERVER_NAME not in mcp_servers:
+            removed = False
+            if SERVER_NAME in mcp_servers:
+                del mcp_servers[SERVER_NAME]
+                removed = True
+            if IDALIB_SERVER_NAME in mcp_servers:
+                del mcp_servers[IDALIB_SERVER_NAME]
+                removed = True
+            if not removed:
                 if not quiet:
                     print(
                         f"Skipping {name} uninstall\n  Config: {config_path} (not installed)"
                     )
                 continue
-            del mcp_servers[SERVER_NAME]
         else:
             mcp_servers[SERVER_NAME] = generate_mcp_config(
                 include_type=(name == "Factory Droid")
             )
+            mcp_servers[IDALIB_SERVER_NAME] = generate_idalib_mcp_config()
 
         # Atomic write: temp file + replace (with Windows-friendly fallback)
         suffix = ".toml" if is_toml else ".json"
@@ -771,7 +788,9 @@ def cmd_list(args):
 
     print(f"Registered IDA instances ({len(instances)}):\n")
     for instance_id, info in instances.items():
-        print(f"  {instance_id}")
+        instance_type = info.get("type", "gui")
+        type_label = "[headless]" if instance_type == "headless" else "[gui]"
+        print(f"  {instance_id}  {type_label}")
         print(f"    Binary: {info.get('binary_name', 'unknown')}")
         print(f"    Path: {info.get('binary_path', 'unknown')}")
         print(f"    Arch: {info.get('arch', 'unknown')}")

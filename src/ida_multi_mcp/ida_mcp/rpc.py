@@ -173,6 +173,10 @@ def unsafe(func):
    return func
 
 
+def get_current_transport_session_id() -> str | None:
+   return MCP_SERVER.get_current_transport_session_id()
+
+
 def ext(group: str):
    """Mark a tool as belonging to an extension group.
 
@@ -202,4 +206,5 @@ __all__ = [
    "get_cached_output",
    "set_download_base_url",
    "get_download_base_url",
+   "get_current_transport_session_id",
 ]

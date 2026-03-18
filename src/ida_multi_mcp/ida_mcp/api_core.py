@@ -4,18 +4,22 @@ import re
 import time
 from typing import Annotated, Optional
 
+import ida_auto
 import ida_hexrays
 import idaapi
 import idautils
+import ida_loader
 import ida_nalt
 import ida_typeinf
 import ida_segment
+import idc
 
 from .rpc import tool
 from .sync import idasync
 
 # Cached strings list: [(ea, text), ...]
 _strings_cache: list[tuple[int, str]] | None = None
+_server_started_at = time.time()
 
 
 def _get_strings_cache() -> list[tuple[int, str]]:
@@ -336,3 +340,83 @@ def find_regex(
         "cursor": {"next": offset + limit} if more else {"done": True},
     }
 
+
+# ============================================================================
+# Health / Warmup
+# ============================================================================
+
+
+def _build_health_payload() -> dict:
+    auto_is_ok = getattr(ida_auto, "auto_is_ok", None)
+    auto_analysis_ready = bool(auto_is_ok()) if callable(auto_is_ok) else None
+
+    hexrays_ready = False
+    try:
+        hexrays_ready = bool(ida_hexrays.init_hexrays_plugin())
+    except Exception:
+        hexrays_ready = False
+
+    idb_path = None
+    try:
+        idb_path = idc.get_idb_path()
+    except Exception:
+        idb_path = None
+
+    return {
+        "status": "ok",
+        "uptime_sec": round(time.time() - _server_started_at, 3),
+        "idb_path": idb_path,
+        "module": ida_nalt.get_root_filename(),
+        "input_path": ida_nalt.get_input_file_path(),
+        "imagebase": hex(idaapi.get_imagebase()),
+        "auto_analysis_ready": auto_analysis_ready,
+        "hexrays_ready": hexrays_ready,
+        "strings_cache_ready": _strings_cache is not None,
+        "strings_cache_size": len(_strings_cache) if _strings_cache is not None else 0,
+    }
+
+
+@tool
+@idasync
+def server_health() -> dict:
+    """Health/ready probe for MCP server and current IDB state."""
+    return _build_health_payload()
+
+
+@tool
+@idasync
+def server_warmup(
+    wait_auto_analysis: Annotated[bool, "Wait for auto analysis queue"] = True,
+    build_caches: Annotated[bool, "Build core caches (currently strings)"] = True,
+    init_hexrays: Annotated[bool, "Initialize Hex-Rays decompiler plugin"] = True,
+) -> dict:
+    """Warm up IDA subsystems to reduce first-call latency and transient failures."""
+    steps = []
+
+    if wait_auto_analysis:
+        t0 = time.perf_counter()
+        ida_auto.auto_wait()
+        steps.append({"step": "auto_wait", "ok": True, "ms": round((time.perf_counter() - t0) * 1000, 2)})
+
+    if build_caches:
+        t0 = time.perf_counter()
+        init_caches()
+        steps.append({"step": "init_caches", "ok": True, "ms": round((time.perf_counter() - t0) * 1000, 2)})
+
+    if init_hexrays:
+        t0 = time.perf_counter()
+        ok = bool(ida_hexrays.init_hexrays_plugin())
+        steps.append(
+            {
+                "step": "init_hexrays",
+                "ok": ok,
+                "ms": round((time.perf_counter() - t0) * 1000, 2),
+                "error": None if ok else "Hex-Rays unavailable",
+            }
+        )
+
+    return {
+        "ok": all(bool(step.get("ok")) for step in steps),
+        "steps": steps,
+        "health": _build_health_payload(),
+    }
